@@ -1,0 +1,20 @@
+# Pasta do Ambiente Virtual
+.venv/
+venv/
+*.venv
+
+# Arquivos de Cache do Python
+__pycache__/
+*.pyc
+
+# Arquivos do VS Code (opcional)
+.vscode/
+
+# Bloquear PDFs e arquivos do Excel
+*.pdf
+*.xls
+*.xlsx
+.ppt
+.pptx   
+
+Apresentação/
