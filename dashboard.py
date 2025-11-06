@@ -5,10 +5,14 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 from io import BytesIO
+import re
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # Para não precisar de interface gráfica
 
 # Configuração da página
 st.set_page_config(
-    page_title="Dashboard de Produtividade - USF São Cristóvão",
+    page_title="Dashboard para análise de produtividade",
     page_icon="📊",
     layout="wide"
 )
@@ -16,7 +20,7 @@ st.set_page_config(
 # Header com botão de recarregar
 col_header1, col_header2 = st.columns([10, 1])
 with col_header1:
-    st.title("📊 Dashboard de Produtividade - USF São Cristóvão")
+    st.title("Dashboard para análise de produtividade")
 with col_header2:
     if st.button("🔄 Recarregar Arquivo", key="btn_recarregar", help="Clique para carregar um novo arquivo"):
         # Limpar session_state relacionado ao arquivo
@@ -100,9 +104,12 @@ def carregar_dados(uploaded_file):
         # Concatenar todos os DataFrames
         df_consolidado = pd.concat(dados_consolidados, ignore_index=True)
         
-        # Limpar dados: tratar valores NaN
+        # Limpar dados: tratar valores NaN e converter para string para evitar tipos mistos
         df_consolidado['Profissional'] = df_consolidado['Profissional'].fillna('Não informado')
+        df_consolidado['Profissional'] = df_consolidado['Profissional'].astype(str).replace('nan', 'Não informado')
+        
         df_consolidado['Especialidade'] = df_consolidado['Especialidade'].fillna('Não informado')
+        df_consolidado['Especialidade'] = df_consolidado['Especialidade'].astype(str).replace('nan', 'Não informado')
         
         # Consolidar status: criar nova coluna Status_Consolidado
         def consolidar_status(status):
@@ -129,6 +136,371 @@ def carregar_dados(uploaded_file):
     except Exception as e:
         st.error(f"Erro ao carregar arquivo: {str(e)}")
         return None, None
+
+# ========== FUNÇÕES DE CRUZAMENTO DE ATENDIMENTOS ==========
+
+def extrair_dia_aba(nome_aba):
+    """Extrai o número do dia do nome da aba (ex: 'Dia 01' -> 1, 'Dia 24' -> 24)"""
+    match = re.search(r'[Dd]ia\s*(\d+)', nome_aba)
+    if match:
+        return int(match.group(1))
+    return None
+
+def preparar_dados_para_cruzamento(df):
+    """
+    Prepara os dados do DataFrame do dashboard para o cruzamento,
+    adicionando coluna Dia_Atendimento extraída do nome da aba
+    """
+    df_cruzamento = df.copy()
+    
+    # Criar coluna Dia_Atendimento a partir da coluna Dia (nome da aba)
+    def extrair_dia_atendimento(nome_aba):
+        dia_num = extrair_dia_aba(nome_aba)
+        if dia_num:
+            return f"Dia {dia_num:02d}"
+        return nome_aba
+    
+    if 'Dia' in df_cruzamento.columns:
+        df_cruzamento['Dia_Atendimento'] = df_cruzamento['Dia'].apply(extrair_dia_atendimento)
+    
+    return df_cruzamento
+
+def cruzar_atendimentos_streamlit(df):
+    """
+    Cruza os atendimentos para identificar quais pacientes foram ao médico
+    sem passar pelo técnico no mesmo dia
+    
+    IMPORTANTE: Considera apenas atendimentos REALIZADOS (status: 
+    'ATENDIMENTO FINALIZADO' ou 'REALIZANDO PROCEDIMENTO/EXAME')
+    """
+    # Preparar dados
+    df_prep = preparar_dados_para_cruzamento(df)
+    
+    # Verificar se as colunas necessárias existem
+    colunas_necessarias = ['Especialidade', 'Status', 'Número Prontuário', 'Dia_Atendimento', 'Profissional']
+    colunas_faltando = [col for col in colunas_necessarias if col not in df_prep.columns]
+    
+    if colunas_faltando:
+        return None, None, None, f"Colunas faltando: {', '.join(colunas_faltando)}"
+    
+    # Buscar especialidades de técnico e médico de forma flexível
+    especialidades_unicas = df_prep['Especialidade'].dropna().unique()
+    
+    # Buscar especialidade de médico (case-insensitive, busca parcial)
+    especialidade_medico = None
+    especialidade_tecnico = None
+    
+    for esp in especialidades_unicas:
+        esp_upper = str(esp).upper()
+        if 'MEDICO' in esp_upper or 'MÉDICO' in esp_upper or 'MEDICINA' in esp_upper:
+            if 'FAMILIA' in esp_upper or 'FAMÍLIA' in esp_upper or 'ESF' in esp_upper:
+                especialidade_medico = esp
+        if 'TECNICO' in esp_upper or 'TÉCNICO' in esp_upper:
+            if 'ENFERMAGEM' in esp_upper:
+                if 'FAMILIA' in esp_upper or 'FAMÍLIA' in esp_upper or 'ESF' in esp_upper:
+                    especialidade_tecnico = esp
+    
+    # Se não encontrou, tentar padrões mais específicos
+    if not especialidade_medico:
+        for esp in especialidades_unicas:
+            esp_upper = str(esp).upper()
+            if 'MEDICO' in esp_upper or 'MÉDICO' in esp_upper:
+                especialidade_medico = esp
+                break
+    
+    if not especialidade_tecnico:
+        for esp in especialidades_unicas:
+            esp_upper = str(esp).upper()
+            if 'TECNICO' in esp_upper or 'TÉCNICO' in esp_upper:
+                especialidade_tecnico = esp
+                break
+    
+    if not especialidade_medico:
+        return None, None, None, f"Especialidade de médico não encontrada. Especialidades disponíveis: {', '.join([str(e) for e in especialidades_unicas[:10]])}"
+    
+    # Status que indicam atendimento realizado (case-insensitive)
+    status_realizados = ['ATENDIMENTO FINALIZADO', 'REALIZANDO PROCEDIMENTO/EXAME']
+    
+    # Converter Status para string e fazer comparação case-insensitive
+    df_prep['Status_Upper'] = df_prep['Status'].astype(str).str.upper()
+    status_realizados_upper = [s.upper() for s in status_realizados]
+    
+    # Filtrar apenas atendimentos de médico que foram REALIZADOS
+    df_medicos = df_prep[
+        (df_prep['Especialidade'] == especialidade_medico) &
+        (df_prep['Status_Upper'].isin(status_realizados_upper))
+    ].copy()
+    
+    if len(df_medicos) == 0:
+        # Verificar se há médicos mas sem status realizado
+        total_medicos = len(df_prep[df_prep['Especialidade'] == especialidade_medico])
+        status_medicos = df_prep[df_prep['Especialidade'] == especialidade_medico]['Status'].value_counts().to_dict()
+        return None, None, None, f"Nenhum atendimento médico realizado encontrado. Total de registros médicos: {total_medicos}. Status encontrados: {status_medicos}"
+    
+    # Filtrar atendimentos de técnico que foram REALIZADOS
+    if especialidade_tecnico:
+        df_tecnicos = df_prep[
+            (df_prep['Especialidade'] == especialidade_tecnico) &
+            (df_prep['Status_Upper'].isin(status_realizados_upper))
+        ].copy()
+    else:
+        df_tecnicos = pd.DataFrame()
+    
+    # Função para verificar se passou pelo técnico
+    def verificar_passou_tecnico(row):
+        prontuario = row['Número Prontuário']
+        dia_atendimento = row['Dia_Atendimento']
+        
+        # Verificar se existe atendimento do técnico para o mesmo paciente no mesmo dia
+        passou = len(df_tecnicos[
+            (df_tecnicos['Número Prontuário'] == prontuario) &
+            (df_tecnicos['Dia_Atendimento'] == dia_atendimento)
+        ]) > 0
+        
+        return passou
+    
+    # Aplicar verificação
+    df_medicos['Passou_Pelo_Tecnico'] = df_medicos.apply(verificar_passou_tecnico, axis=1)
+    
+    # Gerar estatísticas
+    stats = df_medicos.groupby('Profissional').agg({
+        'Número Prontuário': 'count',
+        'Passou_Pelo_Tecnico': lambda x: (x == True).sum(),
+    }).rename(columns={
+        'Número Prontuário': 'Total_Atendimentos',
+        'Passou_Pelo_Tecnico': 'Passou_Pelo_Tecnico'
+    })
+    
+    stats['Nao_Passou_Pelo_Tecnico'] = stats['Total_Atendimentos'] - stats['Passou_Pelo_Tecnico']
+    stats['Percentual_Passou'] = (stats['Passou_Pelo_Tecnico'] / stats['Total_Atendimentos'] * 100).round(2)
+    stats['Percentual_Nao_Passou'] = (stats['Nao_Passou_Pelo_Tecnico'] / stats['Total_Atendimentos'] * 100).round(2)
+    stats = stats.sort_values('Total_Atendimentos', ascending=False)
+    
+    return df_medicos, stats, df_tecnicos, None
+
+def exibir_pagina_cruzamento(df):
+    """Exibe a página de cruzamento de atendimentos no Streamlit"""
+    st.header("🔍 Cruzamento de Atendimentos")
+    st.markdown("""
+    **Análise de Fluxo de Atendimento**
+    
+    Esta análise identifica pacientes que foram atendidos pelo **Médico da Estratégia de Saúde da Família**
+    sem ter passado primeiro pelo **Técnico de Enfermagem da Estratégia de Saúde da Família** no mesmo dia.
+    
+    ⚠️ **Importante:** Apenas atendimentos **REALIZADOS** são considerados (status: ATENDIMENTO FINALIZADO ou REALIZANDO PROCEDIMENTO/EXAME).
+    """)
+    
+    st.markdown("---")
+    
+    # Processar cruzamento
+    with st.spinner("🔄 Processando cruzamento de atendimentos..."):
+        resultado = cruzar_atendimentos_streamlit(df)
+        if len(resultado) == 4:
+            df_medicos, stats, df_tecnicos, mensagem_erro = resultado
+        else:
+            df_medicos, stats, df_tecnicos = resultado
+            mensagem_erro = None
+    
+    if df_medicos is None:
+        st.warning("⚠️ Nenhum atendimento médico realizado encontrado nos dados!")
+        if mensagem_erro:
+            with st.expander("🔍 Informações de Diagnóstico"):
+                st.text(mensagem_erro)
+                
+                # Mostrar informações sobre os dados disponíveis
+                st.markdown("### 📊 Informações sobre os Dados:")
+                st.markdown(f"- **Total de registros:** {len(df)}")
+                
+                if 'Especialidade' in df.columns:
+                    st.markdown("### 🏥 Especialidades encontradas:")
+                    especialidades = df['Especialidade'].value_counts()
+                    st.dataframe(especialidades.reset_index().rename(columns={'index': 'Especialidade', 'Especialidade': 'Quantidade'}), hide_index=True)
+                
+                if 'Status' in df.columns:
+                    st.markdown("### 📋 Status encontrados:")
+                    status = df['Status'].value_counts()
+                    st.dataframe(status.reset_index().rename(columns={'index': 'Status', 'Status': 'Quantidade'}), hide_index=True)
+        return
+    
+    # Métricas principais
+    st.subheader("📊 Métricas Gerais")
+    col1, col2, col3, col4 = st.columns(4)
+    
+    total_medicos = len(df_medicos)
+    total_passou = len(df_medicos[df_medicos['Passou_Pelo_Tecnico'] == True])
+    total_nao_passou = len(df_medicos[df_medicos['Passou_Pelo_Tecnico'] == False])
+    percentual_passou = (total_passou / total_medicos * 100) if total_medicos > 0 else 0
+    
+    with col1:
+        st.metric("Total de Atendimentos Médicos", total_medicos)
+    with col2:
+        st.metric("Passou pelo Técnico", f"{total_passou} ({percentual_passou:.1f}%)")
+    with col3:
+        st.metric("NÃO Passou pelo Técnico", f"{total_nao_passou} ({100-percentual_passou:.1f}%)")
+    with col4:
+        st.metric("Médicos Analisados", len(stats))
+    
+    st.markdown("---")
+    
+    # Estatísticas por médico
+    st.subheader("📈 Estatísticas por Médico")
+    
+    # Gráfico consolidado usando Altair
+    stats_plot = stats.reset_index()
+    stats_plot['Médico'] = stats_plot['Profissional']
+    
+    # Preparar dados para gráfico empilhado
+    dados_grafico = []
+    for _, row in stats_plot.iterrows():
+        dados_grafico.append({
+            'Médico': row['Médico'],
+            'Categoria': 'Passou pelo Técnico',
+            'Quantidade': row['Passou_Pelo_Tecnico']
+        })
+        dados_grafico.append({
+            'Médico': row['Médico'],
+            'Categoria': 'Não Passou pelo Técnico',
+            'Quantidade': row['Nao_Passou_Pelo_Tecnico']
+        })
+    
+    df_grafico = pd.DataFrame(dados_grafico)
+    
+    # Gráfico de barras empilhadas
+    chart = alt.Chart(df_grafico).mark_bar().encode(
+        x=alt.X('Médico:N', sort='-y', title='Médico'),
+        y=alt.Y('Quantidade:Q', title='Quantidade de Atendimentos', stack='zero'),
+        color=alt.Color('Categoria:N', 
+                       scale=alt.Scale(domain=['Passou pelo Técnico', 'Não Passou pelo Técnico'],
+                                      range=['#2ecc71', '#e74c3c']),
+                       legend=alt.Legend(title='Categoria')),
+        tooltip=['Médico', 'Categoria', 'Quantidade']
+    ).properties(
+        height=400,
+        width=800
+    )
+    
+    st.altair_chart(chart, use_container_width=True)
+    
+    # Tabela de estatísticas
+    st.markdown("### 📋 Tabela Detalhada")
+    stats_display = stats.reset_index()
+    stats_display = stats_display.rename(columns={
+        'Profissional': 'Médico',
+        'Total_Atendimentos': 'Total de Atendimentos',
+        'Passou_Pelo_Tecnico': 'Passou pelo Técnico',
+        'Nao_Passou_Pelo_Tecnico': 'Não Passou pelo Técnico',
+        'Percentual_Passou': '% Passou',
+        'Percentual_Nao_Passou': '% Não Passou'
+    })
+    st.dataframe(stats_display, use_container_width=True, hide_index=True)
+    
+    st.markdown("---")
+    
+    # Gráficos individuais por médico
+    st.subheader("📊 Análise Individual por Médico")
+    
+    medicos_selecionados = st.multiselect(
+        "Selecione os médicos para visualização individual:",
+        options=stats.index.tolist(),
+        default=stats.index.tolist()[:3] if len(stats) > 0 else []
+    )
+    
+    if len(medicos_selecionados) > 0:
+        cols = st.columns(min(len(medicos_selecionados), 3))
+        
+        for idx, medico in enumerate(medicos_selecionados):
+            col = cols[idx % 3]
+            
+            with col:
+                medico_stats = stats.loc[medico]
+                
+                # Dados para gráfico
+                dados_medico = pd.DataFrame({
+                    'Categoria': ['Passou pelo\nTécnico', 'Não Passou pelo\nTécnico'],
+                    'Quantidade': [
+                        medico_stats['Passou_Pelo_Tecnico'],
+                        medico_stats['Nao_Passou_Pelo_Tecnico']
+                    ]
+                })
+                
+                # Gráfico de barras
+                chart_medico = alt.Chart(dados_medico).mark_bar().encode(
+                    x=alt.X('Categoria:N', title=''),
+                    y=alt.Y('Quantidade:Q', title='Atendimentos'),
+                    color=alt.Color('Categoria:N',
+                                   scale=alt.Scale(domain=['Passou pelo\nTécnico', 'Não Passou pelo\nTécnico'],
+                                                  range=['#2ecc71', '#e74c3c']),
+                                   legend=None),
+                    tooltip=['Categoria', 'Quantidade']
+                ).properties(
+                    height=300,
+                    title=f"{medico[:30]}..." if len(medico) > 30 else medico
+                )
+                
+                st.altair_chart(chart_medico, use_container_width=True)
+                
+                # Métricas
+                st.metric("Total", int(medico_stats['Total_Atendimentos']))
+                st.metric("Passou", f"{int(medico_stats['Passou_Pelo_Tecnico'])} ({medico_stats['Percentual_Passou']}%)")
+                st.metric("Não Passou", f"{int(medico_stats['Nao_Passou_Pelo_Tecnico'])} ({medico_stats['Percentual_Nao_Passou']}%)")
+    
+    st.markdown("---")
+    
+    # Pacientes para investigação
+    st.subheader("📋 Pacientes para Investigação")
+    st.markdown("Pacientes que foram ao médico sem passar pelo técnico no mesmo dia:")
+    
+    # Filtrar apenas os que NÃO passaram pelo técnico
+    df_nao_passou = df_medicos[df_medicos['Passou_Pelo_Tecnico'] == False].copy()
+    
+    if len(df_nao_passou) > 0:
+        # Selecionar colunas relevantes
+        colunas_saida = ['Paciente', 'Número Prontuário', 'Dia_Atendimento', 'Profissional', 'Status']
+        colunas_existentes = [col for col in colunas_saida if col in df_nao_passou.columns]
+        df_saida = df_nao_passou[colunas_existentes].copy()
+        
+        # Renomear colunas
+        df_saida = df_saida.rename(columns={
+            'Paciente': 'Paciente',
+            'Número Prontuário': 'Prontuário',
+            'Dia_Atendimento': 'Dia de Atendimento',
+            'Profissional': 'Médico',
+            'Status': 'Status do Atendimento'
+        })
+        
+        # Ordenar
+        df_saida = df_saida.sort_values(['Médico', 'Dia de Atendimento', 'Paciente'])
+        
+        st.dataframe(df_saida, use_container_width=True, hide_index=True)
+        
+        # Botão para download
+        st.download_button(
+            label="📥 Baixar Planilha de Pacientes para Investigação",
+            data=df_saida.to_csv(index=False).encode('utf-8-sig'),
+            file_name="pacientes_para_investigacao.csv",
+            mime="text/csv"
+        )
+    else:
+        st.success("✅ Todos os pacientes passaram pelo técnico antes do médico!")
+    
+    st.markdown("---")
+    
+    # Informações adicionais
+    with st.expander("ℹ️ Informações sobre o Filtro"):
+        st.markdown("""
+        **Status Considerados:**
+        - ATENDIMENTO FINALIZADO
+        - REALIZANDO PROCEDIMENTO/EXAME
+        
+        **Status Excluídos:**
+        - AGENDADO
+        - AGUARDANDO ATENDIMENTO
+        - FALTOSO
+        - EVADIDO
+        
+        Apenas atendimentos **realizados** são considerados para garantir que os dados reflitam
+        o fluxo real de atendimento dos pacientes.
+        """)
 
 # Controlar se mostra o upload ou não
 mostrar_upload = True
@@ -512,443 +884,451 @@ if uploaded_file is not None:
         
         st.markdown("---")
         
-        # ========== MÉTRICAS KPIs ==========
-        st.header("📈 Métricas Principais")
+        # ========== TABS PARA NAVEGAÇÃO ==========
+        tab1, tab2 = st.tabs(["📊 Dashboard Principal", "🔍 Cruzamento de Atendimentos"])
         
-        col1, col2, col3, col4 = st.columns(4)
-        
-        # Calcular métricas usando Status_Consolidado
-        total_atendimentos_realizados = len(df_filtrado[df_filtrado['Status_Consolidado'] == 'Atendimento realizado'])
-        total_faltosos = len(df_filtrado[df_filtrado['Status_Consolidado'] == 'Faltoso'])
-        total_evadidos = len(df_filtrado[df_filtrado['Status_Consolidado'] == 'Evadido'])
-        total_registros = len(df_filtrado)
-        
-        # Percentuais
-        percentual_faltosos = (total_faltosos / total_registros * 100) if total_registros > 0 else 0
-        percentual_evadidos = (total_evadidos / total_registros * 100) if total_registros > 0 else 0
-        
-        # Média de atendimentos por dia
-        dias_unicos = df_filtrado['Dia'].nunique()
-        media_por_dia = (total_atendimentos_realizados / dias_unicos) if dias_unicos > 0 else 0
-        
-        with col1:
-            st.metric(
-                "Total de Atendimentos Realizados",
-                total_atendimentos_realizados
-            )
-        
-        with col2:
-            st.metric(
-                "Média de Atendimentos/Dia",
-                f"{media_por_dia:.1f}"
-            )
-        
-        with col3:
-            st.metric(
-                "Percentual de Faltosos",
-                f"{percentual_faltosos:.2f}%",
-                delta=f"{total_faltosos} faltosos"
-            )
-        
-        with col4:
-            st.metric(
-                "Percentual de Evadidos",
-                f"{percentual_evadidos:.2f}%",
-                delta=f"{total_evadidos} evadidos"
-            )
-        
-        # Informações de Faltosos e Evadidos
-        st.markdown("---")
-        col_info1, col_info2 = st.columns(2)
-        
-        with col_info1:
-            st.info(f"📋 **Quantidade de Faltosos:** {total_faltosos} | **Percentual:** {percentual_faltosos:.2f}%")
+        with tab1:
+            # ========== MÉTRICAS KPIs ==========
+            st.header("📈 Métricas Principais")
             
-            # Expander com detalhes por profissional
-            with st.expander("📊 Ver percentual de faltosos por profissional"):
-                # Calcular faltosos por profissional
-                df_faltosos = df_filtrado[df_filtrado['Status_Consolidado'] == 'Faltoso']
+            col1, col2, col3, col4 = st.columns(4)
+            
+            # Calcular métricas usando Status_Consolidado
+            total_atendimentos_realizados = len(df_filtrado[df_filtrado['Status_Consolidado'] == 'Atendimento realizado'])
+            total_faltosos = len(df_filtrado[df_filtrado['Status_Consolidado'] == 'Faltoso'])
+            total_evadidos = len(df_filtrado[df_filtrado['Status_Consolidado'] == 'Evadido'])
+            total_registros = len(df_filtrado)
+            
+            # Percentuais
+            percentual_faltosos = (total_faltosos / total_registros * 100) if total_registros > 0 else 0
+            percentual_evadidos = (total_evadidos / total_registros * 100) if total_registros > 0 else 0
+            
+            # Média de atendimentos por dia
+            dias_unicos = df_filtrado['Dia'].nunique()
+            media_por_dia = (total_atendimentos_realizados / dias_unicos) if dias_unicos > 0 else 0
+            
+            with col1:
+                st.metric(
+                    "Total de Atendimentos Realizados",
+                    total_atendimentos_realizados
+                )
+            
+            with col2:
+                st.metric(
+                    "Média de Atendimentos/Dia",
+                    f"{media_por_dia:.1f}"
+                )
+            
+            with col3:
+                st.metric(
+                    "Percentual de Faltosos",
+                    f"{percentual_faltosos:.2f}%",
+                    delta=f"{total_faltosos} faltosos"
+                )
+            
+            with col4:
+                st.metric(
+                    "Percentual de Evadidos",
+                    f"{percentual_evadidos:.2f}%",
+                    delta=f"{total_evadidos} evadidos"
+                )
+            
+            # Informações de Faltosos e Evadidos
+            st.markdown("---")
+            col_info1, col_info2 = st.columns(2)
+            
+            with col_info1:
+                st.info(f"📋 **Quantidade de Faltosos:** {total_faltosos} | **Percentual:** {percentual_faltosos:.2f}%")
                 
-                if len(df_faltosos) > 0:
-                    # Contagem de faltosos por profissional
-                    faltosos_por_prof = df_faltosos.groupby('Profissional').size().reset_index(name='Qtd Faltosos')
+                # Expander com detalhes por profissional
+                with st.expander("📊 Ver percentual de faltosos por profissional"):
+                    # Calcular faltosos por profissional
+                    df_faltosos = df_filtrado[df_filtrado['Status_Consolidado'] == 'Faltoso']
                     
-                    # Contagem total de registros por profissional (todos os status) - apenas para calcular percentual
-                    total_por_prof = df_filtrado.groupby('Profissional').size().reset_index(name='Total Registros')
-                    
-                    # Calcular percentual
-                    percentual_por_prof = faltosos_por_prof.merge(total_por_prof, on='Profissional', how='left')
-                    percentual_por_prof['Percentual'] = (percentual_por_prof['Qtd Faltosos'] / percentual_por_prof['Total Registros'] * 100).round(2)
-                    percentual_por_prof = percentual_por_prof.sort_values('Percentual', ascending=False)
-                    
-                    # Exibir tabela - apenas Profissional, Quantidade de Faltosos e Percentual
-                    st.dataframe(
-                        percentual_por_prof[['Profissional', 'Qtd Faltosos', 'Percentual']].rename(
-                            columns={
-                                'Profissional': 'Profissional',
-                                'Qtd Faltosos': 'Quantidade de Faltosos',
-                                'Percentual': 'Percentual (%)'
-                            }
-                        ),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                else:
-                    st.info("Nenhum registro de faltosos encontrado para os filtros selecionados.")
-        
-        with col_info2:
-            st.info(f"📋 **Quantidade de Evadidos:** {total_evadidos} | **Percentual:** {percentual_evadidos:.2f}%")
+                    if len(df_faltosos) > 0:
+                        # Contagem de faltosos por profissional
+                        faltosos_por_prof = df_faltosos.groupby('Profissional').size().reset_index(name='Qtd Faltosos')
+                        
+                        # Contagem total de registros por profissional (todos os status) - apenas para calcular percentual
+                        total_por_prof = df_filtrado.groupby('Profissional').size().reset_index(name='Total Registros')
+                        
+                        # Calcular percentual
+                        percentual_por_prof = faltosos_por_prof.merge(total_por_prof, on='Profissional', how='left')
+                        percentual_por_prof['Percentual'] = (percentual_por_prof['Qtd Faltosos'] / percentual_por_prof['Total Registros'] * 100).round(2)
+                        percentual_por_prof = percentual_por_prof.sort_values('Percentual', ascending=False)
+                        
+                        # Exibir tabela - apenas Profissional, Quantidade de Faltosos e Percentual
+                        st.dataframe(
+                            percentual_por_prof[['Profissional', 'Qtd Faltosos', 'Percentual']].rename(
+                                columns={
+                                    'Profissional': 'Profissional',
+                                    'Qtd Faltosos': 'Quantidade de Faltosos',
+                                    'Percentual': 'Percentual (%)'
+                                }
+                            ),
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                    else:
+                        st.info("Nenhum registro de faltosos encontrado para os filtros selecionados.")
             
-            # Expander com detalhes por profissional
-            with st.expander("📊 Ver percentual de evadidos por profissional"):
-                # Calcular evadidos por profissional
-                df_evadidos = df_filtrado[df_filtrado['Status_Consolidado'] == 'Evadido']
+            with col_info2:
+                st.info(f"📋 **Quantidade de Evadidos:** {total_evadidos} | **Percentual:** {percentual_evadidos:.2f}%")
                 
-                if len(df_evadidos) > 0:
-                    # Contagem de evadidos por profissional
-                    evadidos_por_prof = df_evadidos.groupby('Profissional').size().reset_index(name='Qtd Evadidos')
+                # Expander com detalhes por profissional
+                with st.expander("📊 Ver percentual de evadidos por profissional"):
+                    # Calcular evadidos por profissional
+                    df_evadidos = df_filtrado[df_filtrado['Status_Consolidado'] == 'Evadido']
                     
-                    # Contagem total de registros por profissional (todos os status) - apenas para calcular percentual
-                    total_por_prof = df_filtrado.groupby('Profissional').size().reset_index(name='Total Registros')
-                    
-                    # Calcular percentual
-                    percentual_por_prof = evadidos_por_prof.merge(total_por_prof, on='Profissional', how='left')
-                    percentual_por_prof['Percentual'] = (percentual_por_prof['Qtd Evadidos'] / percentual_por_prof['Total Registros'] * 100).round(2)
-                    percentual_por_prof = percentual_por_prof.sort_values('Percentual', ascending=False)
-                    
-                    # Exibir tabela - apenas Profissional, Quantidade de Evadidos e Percentual
-                    st.dataframe(
-                        percentual_por_prof[['Profissional', 'Qtd Evadidos', 'Percentual']].rename(
-                            columns={
-                                'Profissional': 'Profissional',
-                                'Qtd Evadidos': 'Quantidade de Evadidos',
-                                'Percentual': 'Percentual (%)'
-                            }
-                        ),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                else:
-                    st.info("Nenhum registro de evadidos encontrado para os filtros selecionados.")
-        
-        st.markdown("---")
-        
-        # ========== GRÁFICOS ==========
-        st.header("📊 Visualizações")
-        
-        # Preparar dados para gráficos (usando Status_Consolidado)
-        df_finalizados = df_filtrado[df_filtrado['Status_Consolidado'] == 'Atendimento realizado']
-        
-        # Gráfico 1: Atendimentos por Profissional (ocupando toda a largura)
-        # Opção de tipo de gráfico acima do gráfico
-        tipo_grafico_profissional = st.selectbox(
-            "Tipo de gráfico:",
-            ["Barras", "Pizza", "Linhas"],
-            key="tipo_graf_prof",
-            index=0
-        )
-        
-        st.subheader("Atendimentos por Profissional")
-        
-        # Contagem por profissional
-        atendimentos_profissional = df_finalizados.groupby('Profissional').size().reset_index(name='Qtd Atendimentos')
-        atendimentos_profissional = atendimentos_profissional.sort_values('Qtd Atendimentos', ascending=False)
-        
-        # Criar campo combinado com profissional e quantidade para a legenda (todos os tipos de gráfico)
-        atendimentos_profissional_com_legenda = atendimentos_profissional.copy()
-        atendimentos_profissional_com_legenda['Profissional_Completo'] = atendimentos_profissional_com_legenda.apply(
-            lambda row: f"{row['Profissional']} ({row['Qtd Atendimentos']} atendimentos)", 
-            axis=1
-        )
-        
-        # Criar gráfico baseado na seleção
-        if tipo_grafico_profissional == "Barras":
-            chart_profissional = alt.Chart(atendimentos_profissional_com_legenda).mark_bar().encode(
-                x=alt.X('Qtd Atendimentos:Q', title='Quantidade de Atendimentos'),
-                y=alt.Y('Profissional:N', sort='-x', title='Profissional'),
-                color=alt.Color('Qtd Atendimentos:Q', scale=alt.Scale(scheme='blues')),
-                tooltip=[alt.Tooltip('Profissional:N', title='Profissional'), 
-                        alt.Tooltip('Qtd Atendimentos:Q', title='Atendimentos')]
-            ).properties(height=400)
-        elif tipo_grafico_profissional == "Pizza":
-            chart_profissional = alt.Chart(atendimentos_profissional_com_legenda).mark_arc(innerRadius=0).encode(
-                theta=alt.Theta('Qtd Atendimentos:Q', stack=True),
-                color=alt.Color('Profissional_Completo:N', 
-                              scale=alt.Scale(scheme='category20'),
-                              legend=alt.Legend(title='Profissional', 
-                                              orient='right',
-                                              labelLimit=500,  # Valor alto para evitar truncamento
-                                              labelFontSize=14,  # Fonte maior
-                                              titleFontSize=16,  # Título da legenda maior
-                                              offset=10,  # Espaçamento próximo ao gráfico
-                                              padding=10,  # Espaçamento interno
-                                              columnPadding=5)),  # Espaçamento entre itens
-                tooltip=[alt.Tooltip('Profissional:N', title='Profissional'), 
-                        alt.Tooltip('Qtd Atendimentos:Q', title='Atendimentos')]
-            ).properties(height=400, width=500).configure_view(strokeWidth=0)
-        else:  # Linhas
-            chart_profissional = alt.Chart(atendimentos_profissional_com_legenda).mark_line(point=True).encode(
-                x=alt.X('Profissional:N', sort='-y', title='Profissional'),
-                y=alt.Y('Qtd Atendimentos:Q', title='Quantidade de Atendimentos'),
-                tooltip=[alt.Tooltip('Profissional:N', title='Profissional'), 
-                        alt.Tooltip('Qtd Atendimentos:Q', title='Atendimentos')]
-            ).properties(height=400)
-        
-        st.altair_chart(chart_profissional, use_container_width=True)
-        
-        # Estatísticas abaixo do gráfico
-        if len(atendimentos_profissional) > 0:
-            st.caption(f"📊 **Total:** {atendimentos_profissional['Qtd Atendimentos'].sum()} atendimentos | "
-                      f"**Média:** {atendimentos_profissional['Qtd Atendimentos'].mean():.1f} | "
-                      f"**Máximo:** {atendimentos_profissional['Qtd Atendimentos'].max()}")
-        
-        st.markdown("---")
-        
-        # Gráfico 2: Atendimentos por Especialidades (ocupando toda a largura, abaixo do anterior)
-        # Opção de tipo de gráfico acima do gráfico
-        tipo_grafico_equipe = st.selectbox(
-            "Tipo de gráfico:",
-            ["Barras", "Pizza", "Linhas"],
-            key="tipo_graf_equipe",
-            index=0
-        )
-        
-        st.subheader("Atendimentos por Especialidades")
-        
-        # Contagem por equipe (Especialidade)
-        atendimentos_equipe = df_finalizados.groupby('Especialidade').size().reset_index(name='Qtd Atendimentos')
-        atendimentos_equipe = atendimentos_equipe.sort_values('Qtd Atendimentos', ascending=False)
-        
-        # Criar campo combinado com especialidade e quantidade para a legenda (todos os tipos de gráfico)
-        atendimentos_equipe_com_legenda = atendimentos_equipe.copy()
-        atendimentos_equipe_com_legenda['Especialidade_Completa'] = atendimentos_equipe_com_legenda.apply(
-            lambda row: f"{row['Especialidade']} ({row['Qtd Atendimentos']} atendimentos)", 
-            axis=1
-        )
-        
-        # Criar gráfico baseado na seleção
-        if tipo_grafico_equipe == "Barras":
-            chart_equipe = alt.Chart(atendimentos_equipe_com_legenda).mark_bar().encode(
-                x=alt.X('Qtd Atendimentos:Q', title='Quantidade de Atendimentos'),
-                y=alt.Y('Especialidade:N', sort='-x', title='Especialidade'),
-                color=alt.Color('Qtd Atendimentos:Q', scale=alt.Scale(scheme='greens')),
-                tooltip=[alt.Tooltip('Especialidade:N', title='Especialidade'), 
-                        alt.Tooltip('Qtd Atendimentos:Q', title='Atendimentos')]
-            ).properties(height=400)
-        elif tipo_grafico_equipe == "Pizza":
-            chart_equipe = alt.Chart(atendimentos_equipe_com_legenda).mark_arc(innerRadius=0).encode(
-                theta=alt.Theta('Qtd Atendimentos:Q', stack=True),
-                color=alt.Color('Especialidade_Completa:N', 
-                              scale=alt.Scale(scheme='category10'),
-                              legend=alt.Legend(title='Especialidade', 
-                                              orient='right',
-                                              labelLimit=500,  # Valor alto para evitar truncamento
-                                              labelFontSize=14,  # Fonte maior
-                                              titleFontSize=16,  # Título da legenda maior
-                                              offset=10,  # Espaçamento próximo ao gráfico
-                                              padding=10,  # Espaçamento interno
-                                              columnPadding=5)),  # Espaçamento entre itens
-                tooltip=[alt.Tooltip('Especialidade:N', title='Especialidade'), 
-                        alt.Tooltip('Qtd Atendimentos:Q', title='Atendimentos')]
-            ).properties(height=400, width=500).configure_view(strokeWidth=0)
-        else:  # Linhas
-            chart_equipe = alt.Chart(atendimentos_equipe_com_legenda).mark_line(point=True).encode(
-                x=alt.X('Especialidade:N', sort='-y', title='Especialidade'),
-                y=alt.Y('Qtd Atendimentos:Q', title='Quantidade de Atendimentos'),
-                tooltip=[alt.Tooltip('Especialidade:N', title='Especialidade'), 
-                        alt.Tooltip('Qtd Atendimentos:Q', title='Atendimentos')]
-            ).properties(height=400)
-        
-        st.altair_chart(chart_equipe, use_container_width=True)
-        
-        # Estatísticas abaixo do gráfico
-        if len(atendimentos_equipe) > 0:
-            st.caption(f"📊 **Total:** {atendimentos_equipe['Qtd Atendimentos'].sum()} atendimentos")
-        
-        # Gráfico de Evolução dos Atendimentos por Dia e Profissional
-        st.markdown("---")
-        st.subheader("📈 Evolução dos Atendimentos por Dia")
-        
-        # Seletor de tipo de gráfico
-        tipo_grafico_temporal = st.selectbox(
-            "Tipo de gráfico:",
-            ["Linhas", "Barras"],
-            key="tipo_graf_temporal",
-            index=0
-        )
-        
-        # Obter todos os dias disponíveis nos dados filtrados (não apenas finalizados)
-        todos_dias_disponiveis = sorted(df_filtrado['Dia'].unique())
-        
-        # Contagem por dia e profissional (apenas finalizados)
-        atendimentos_por_dia_prof = df_finalizados.groupby(['Dia', 'Profissional']).size().reset_index(name='Qtd Atendimentos')
-        
-        # Criar estrutura completa: todos os dias x todos os profissionais
-        # Isso garante que todos os dias apareçam, mesmo sem atendimentos
-        from itertools import product
-        
-        if len(profissionais_selecionados) > 0 and len(todos_dias_disponiveis) > 0:
-            # Criar todas as combinações de dia e profissional
-            combinacoes = pd.DataFrame(
-                list(product(todos_dias_disponiveis, profissionais_selecionados)),
-                columns=['Dia', 'Profissional']
+                    if len(df_evadidos) > 0:
+                        # Contagem de evadidos por profissional
+                        evadidos_por_prof = df_evadidos.groupby('Profissional').size().reset_index(name='Qtd Evadidos')
+                        
+                        # Contagem total de registros por profissional (todos os status) - apenas para calcular percentual
+                        total_por_prof = df_filtrado.groupby('Profissional').size().reset_index(name='Total Registros')
+                        
+                        # Calcular percentual
+                        percentual_por_prof = evadidos_por_prof.merge(total_por_prof, on='Profissional', how='left')
+                        percentual_por_prof['Percentual'] = (percentual_por_prof['Qtd Evadidos'] / percentual_por_prof['Total Registros'] * 100).round(2)
+                        percentual_por_prof = percentual_por_prof.sort_values('Percentual', ascending=False)
+                        
+                        # Exibir tabela - apenas Profissional, Quantidade de Evadidos e Percentual
+                        st.dataframe(
+                            percentual_por_prof[['Profissional', 'Qtd Evadidos', 'Percentual']].rename(
+                                columns={
+                                    'Profissional': 'Profissional',
+                                    'Qtd Evadidos': 'Quantidade de Evadidos',
+                                    'Percentual': 'Percentual (%)'
+                                }
+                            ),
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                    else:
+                        st.info("Nenhum registro de evadidos encontrado para os filtros selecionados.")
+            
+            st.markdown("---")
+            
+            # ========== GRÁFICOS ==========
+            st.header("📊 Visualizações")
+            
+            # Preparar dados para gráficos (usando Status_Consolidado)
+            df_finalizados = df_filtrado[df_filtrado['Status_Consolidado'] == 'Atendimento realizado']
+            
+            # Gráfico 1: Atendimentos por Profissional (ocupando toda a largura)
+            # Opção de tipo de gráfico acima do gráfico
+            tipo_grafico_profissional = st.selectbox(
+                "Tipo de gráfico:",
+                ["Barras", "Pizza", "Linhas"],
+                key="tipo_graf_prof",
+                index=0
             )
             
-            # Fazer merge com os dados reais, preenchendo com 0 onde não houver dados
-            atendimentos_completo = combinacoes.merge(
-                atendimentos_por_dia_prof,
-                on=['Dia', 'Profissional'],
-                how='left'
-            ).fillna(0)
+            st.subheader("Atendimentos por Profissional")
             
-            # Garantir que Qtd Atendimentos seja inteiro
-            atendimentos_completo['Qtd Atendimentos'] = atendimentos_completo['Qtd Atendimentos'].astype(int)
+            # Contagem por profissional
+            atendimentos_profissional = df_finalizados.groupby('Profissional').size().reset_index(name='Qtd Atendimentos')
+            atendimentos_profissional = atendimentos_profissional.sort_values('Qtd Atendimentos', ascending=False)
             
-            # Ordenar por dia
-            atendimentos_completo = atendimentos_completo.sort_values('Dia')
-            
-            # Calcular média para exibição
-            media_atendimentos = atendimentos_completo['Qtd Atendimentos'].mean() if len(atendimentos_completo) > 0 else 0
+            # Criar campo combinado com profissional e quantidade para a legenda (todos os tipos de gráfico)
+            atendimentos_profissional_com_legenda = atendimentos_profissional.copy()
+            atendimentos_profissional_com_legenda['Profissional_Completo'] = atendimentos_profissional_com_legenda.apply(
+                lambda row: f"{row['Profissional']} ({row['Qtd Atendimentos']} atendimentos)", 
+                axis=1
+            )
             
             # Criar gráfico baseado na seleção
-            if tipo_grafico_temporal == "Linhas":
-                # Criar gráfico base
-                chart_base = alt.Chart(atendimentos_completo).encode(
-                    x=alt.X('Dia:N', sort='x', title='Dia'),
+            if tipo_grafico_profissional == "Barras":
+                chart_profissional = alt.Chart(atendimentos_profissional_com_legenda).mark_bar().encode(
+                    x=alt.X('Qtd Atendimentos:Q', title='Quantidade de Atendimentos'),
+                    y=alt.Y('Profissional:N', sort='-x', title='Profissional'),
+                    color=alt.Color('Qtd Atendimentos:Q', scale=alt.Scale(scheme='blues')),
+                    tooltip=[alt.Tooltip('Profissional:N', title='Profissional'), 
+                            alt.Tooltip('Qtd Atendimentos:Q', title='Atendimentos')]
+                ).properties(height=400)
+            elif tipo_grafico_profissional == "Pizza":
+                chart_profissional = alt.Chart(atendimentos_profissional_com_legenda).mark_arc(innerRadius=0).encode(
+                    theta=alt.Theta('Qtd Atendimentos:Q', stack=True),
+                    color=alt.Color('Profissional_Completo:N', 
+                                  scale=alt.Scale(scheme='category20'),
+                                  legend=alt.Legend(title='Profissional', 
+                                                  orient='right',
+                                                  labelLimit=500,  # Valor alto para evitar truncamento
+                                                  labelFontSize=14,  # Fonte maior
+                                                  titleFontSize=16,  # Título da legenda maior
+                                                  offset=10,  # Espaçamento próximo ao gráfico
+                                                  padding=10,  # Espaçamento interno
+                                                  columnPadding=5)),  # Espaçamento entre itens
+                    tooltip=[alt.Tooltip('Profissional:N', title='Profissional'), 
+                            alt.Tooltip('Qtd Atendimentos:Q', title='Atendimentos')]
+                ).properties(height=400, width=500).configure_view(strokeWidth=0)
+            else:  # Linhas
+                chart_profissional = alt.Chart(atendimentos_profissional_com_legenda).mark_line(point=True).encode(
+                    x=alt.X('Profissional:N', sort='-y', title='Profissional'),
                     y=alt.Y('Qtd Atendimentos:Q', title='Quantidade de Atendimentos'),
-                    tooltip=['Dia', 'Profissional', 'Qtd Atendimentos']
+                    tooltip=[alt.Tooltip('Profissional:N', title='Profissional'), 
+                            alt.Tooltip('Qtd Atendimentos:Q', title='Atendimentos')]
+                ).properties(height=400)
+            
+            st.altair_chart(chart_profissional, use_container_width=True)
+            
+            # Estatísticas abaixo do gráfico
+            if len(atendimentos_profissional) > 0:
+                st.caption(f"📊 **Total:** {atendimentos_profissional['Qtd Atendimentos'].sum()} atendimentos | "
+                          f"**Média:** {atendimentos_profissional['Qtd Atendimentos'].mean():.1f} | "
+                          f"**Máximo:** {atendimentos_profissional['Qtd Atendimentos'].max()}")
+            
+            st.markdown("---")
+            
+            # Gráfico 2: Atendimentos por Especialidades (ocupando toda a largura, abaixo do anterior)
+            # Opção de tipo de gráfico acima do gráfico
+            tipo_grafico_equipe = st.selectbox(
+                "Tipo de gráfico:",
+                ["Barras", "Pizza", "Linhas"],
+                key="tipo_graf_equipe",
+                index=0
+            )
+            
+            st.subheader("Atendimentos por Especialidades")
+            
+            # Contagem por equipe (Especialidade)
+            atendimentos_equipe = df_finalizados.groupby('Especialidade').size().reset_index(name='Qtd Atendimentos')
+            atendimentos_equipe = atendimentos_equipe.sort_values('Qtd Atendimentos', ascending=False)
+            
+            # Criar campo combinado com especialidade e quantidade para a legenda (todos os tipos de gráfico)
+            atendimentos_equipe_com_legenda = atendimentos_equipe.copy()
+            atendimentos_equipe_com_legenda['Especialidade_Completa'] = atendimentos_equipe_com_legenda.apply(
+                lambda row: f"{row['Especialidade']} ({row['Qtd Atendimentos']} atendimentos)", 
+                axis=1
+            )
+            
+            # Criar gráfico baseado na seleção
+            if tipo_grafico_equipe == "Barras":
+                chart_equipe = alt.Chart(atendimentos_equipe_com_legenda).mark_bar().encode(
+                    x=alt.X('Qtd Atendimentos:Q', title='Quantidade de Atendimentos'),
+                    y=alt.Y('Especialidade:N', sort='-x', title='Especialidade'),
+                    color=alt.Color('Qtd Atendimentos:Q', scale=alt.Scale(scheme='greens')),
+                    tooltip=[alt.Tooltip('Especialidade:N', title='Especialidade'), 
+                            alt.Tooltip('Qtd Atendimentos:Q', title='Atendimentos')]
+                ).properties(height=400)
+            elif tipo_grafico_equipe == "Pizza":
+                chart_equipe = alt.Chart(atendimentos_equipe_com_legenda).mark_arc(innerRadius=0).encode(
+                    theta=alt.Theta('Qtd Atendimentos:Q', stack=True),
+                    color=alt.Color('Especialidade_Completa:N', 
+                                  scale=alt.Scale(scheme='category10'),
+                                  legend=alt.Legend(title='Especialidade', 
+                                                  orient='right',
+                                                  labelLimit=500,  # Valor alto para evitar truncamento
+                                                  labelFontSize=14,  # Fonte maior
+                                                  titleFontSize=16,  # Título da legenda maior
+                                                  offset=10,  # Espaçamento próximo ao gráfico
+                                                  padding=10,  # Espaçamento interno
+                                                  columnPadding=5)),  # Espaçamento entre itens
+                    tooltip=[alt.Tooltip('Especialidade:N', title='Especialidade'), 
+                            alt.Tooltip('Qtd Atendimentos:Q', title='Atendimentos')]
+                ).properties(height=400, width=500).configure_view(strokeWidth=0)
+            else:  # Linhas
+                chart_equipe = alt.Chart(atendimentos_equipe_com_legenda).mark_line(point=True).encode(
+                    x=alt.X('Especialidade:N', sort='-y', title='Especialidade'),
+                    y=alt.Y('Qtd Atendimentos:Q', title='Quantidade de Atendimentos'),
+                    tooltip=[alt.Tooltip('Especialidade:N', title='Especialidade'), 
+                            alt.Tooltip('Qtd Atendimentos:Q', title='Atendimentos')]
+                ).properties(height=400)
+            
+            st.altair_chart(chart_equipe, use_container_width=True)
+            
+            # Estatísticas abaixo do gráfico
+            if len(atendimentos_equipe) > 0:
+                st.caption(f"📊 **Total:** {atendimentos_equipe['Qtd Atendimentos'].sum()} atendimentos")
+            
+            # Gráfico de Evolução dos Atendimentos por Dia e Profissional
+            st.markdown("---")
+            st.subheader("📈 Evolução dos Atendimentos por Dia")
+            
+            # Seletor de tipo de gráfico
+            tipo_grafico_temporal = st.selectbox(
+                "Tipo de gráfico:",
+                ["Linhas", "Barras"],
+                key="tipo_graf_temporal",
+                index=0
+            )
+            
+            # Obter todos os dias disponíveis nos dados filtrados (não apenas finalizados)
+            todos_dias_disponiveis = sorted(df_filtrado['Dia'].unique())
+            
+            # Contagem por dia e profissional (apenas finalizados)
+            atendimentos_por_dia_prof = df_finalizados.groupby(['Dia', 'Profissional']).size().reset_index(name='Qtd Atendimentos')
+            
+            # Criar estrutura completa: todos os dias x todos os profissionais
+            # Isso garante que todos os dias apareçam, mesmo sem atendimentos
+            from itertools import product
+            
+            if len(profissionais_selecionados) > 0 and len(todos_dias_disponiveis) > 0:
+                # Criar todas as combinações de dia e profissional
+                combinacoes = pd.DataFrame(
+                    list(product(todos_dias_disponiveis, profissionais_selecionados)),
+                    columns=['Dia', 'Profissional']
                 )
                 
-                # Linha para cada profissional (com cores diferentes)
-                chart_temporal = chart_base.mark_line(
-                    point=True,
-                    strokeWidth=3
-                ).encode(
-                    color=alt.Color(
-                        'Profissional:N',
-                        scale=alt.Scale(scheme='category20'),
-                        legend=alt.Legend(title='Profissional', orient='right')
+                # Fazer merge com os dados reais, preenchendo com 0 onde não houver dados
+                atendimentos_completo = combinacoes.merge(
+                    atendimentos_por_dia_prof,
+                    on=['Dia', 'Profissional'],
+                    how='left'
+                ).fillna(0)
+                
+                # Garantir que Qtd Atendimentos seja inteiro
+                atendimentos_completo['Qtd Atendimentos'] = atendimentos_completo['Qtd Atendimentos'].astype(int)
+                
+                # Ordenar por dia
+                atendimentos_completo = atendimentos_completo.sort_values('Dia')
+                
+                # Calcular média para exibição
+                media_atendimentos = atendimentos_completo['Qtd Atendimentos'].mean() if len(atendimentos_completo) > 0 else 0
+                
+                # Criar gráfico baseado na seleção
+                if tipo_grafico_temporal == "Linhas":
+                    # Criar gráfico base
+                    chart_base = alt.Chart(atendimentos_completo).encode(
+                        x=alt.X('Dia:N', sort='x', title='Dia'),
+                        y=alt.Y('Qtd Atendimentos:Q', title='Quantidade de Atendimentos'),
+                        tooltip=['Dia', 'Profissional', 'Qtd Atendimentos']
                     )
-                ).properties(
-                    height=400,
-                    width=800
-                )
-            else:  # Barras
-                # Gráfico de barras agrupadas por dia (lado a lado)
-                # No Altair, barras agrupadas são criadas usando x para categoria principal
-                # e color para subcategoria, o que automaticamente cria barras lado a lado
-                chart_temporal = alt.Chart(atendimentos_completo).mark_bar(
-                    cornerRadiusTopLeft=3,
-                    cornerRadiusTopRight=3
-                ).encode(
-                    x=alt.X('Dia:N', sort='x', title='Dia', axis=alt.Axis(labelAngle=-45)),
-                    y=alt.Y('Qtd Atendimentos:Q', title='Quantidade de Atendimentos', scale=alt.Scale(domain=[0, None])),
-                    color=alt.Color(
-                        'Profissional:N',
-                        scale=alt.Scale(scheme='category20'),
-                        legend=alt.Legend(title='Profissional', orient='right')
-                    ),
-                    tooltip=['Dia', 'Profissional', 'Qtd Atendimentos']
-                ).properties(
-                    height=400,
-                    width=800
-                )
+                    
+                    # Linha para cada profissional (com cores diferentes)
+                    chart_temporal = chart_base.mark_line(
+                        point=True,
+                        strokeWidth=3
+                    ).encode(
+                        color=alt.Color(
+                            'Profissional:N',
+                            scale=alt.Scale(scheme='category20'),
+                            legend=alt.Legend(title='Profissional', orient='right')
+                        )
+                    ).properties(
+                        height=400,
+                        width=800
+                    )
+                else:  # Barras
+                    # Gráfico de barras agrupadas por dia (lado a lado)
+                    # No Altair, barras agrupadas são criadas usando x para categoria principal
+                    # e color para subcategoria, o que automaticamente cria barras lado a lado
+                    chart_temporal = alt.Chart(atendimentos_completo).mark_bar(
+                        cornerRadiusTopLeft=3,
+                        cornerRadiusTopRight=3
+                    ).encode(
+                        x=alt.X('Dia:N', sort='x', title='Dia', axis=alt.Axis(labelAngle=-45)),
+                        y=alt.Y('Qtd Atendimentos:Q', title='Quantidade de Atendimentos', scale=alt.Scale(domain=[0, None])),
+                        color=alt.Color(
+                            'Profissional:N',
+                            scale=alt.Scale(scheme='category20'),
+                            legend=alt.Legend(title='Profissional', orient='right')
+                        ),
+                        tooltip=['Dia', 'Profissional', 'Qtd Atendimentos']
+                    ).properties(
+                        height=400,
+                        width=800
+                    )
+                
+                st.altair_chart(chart_temporal, use_container_width=True)
+                
+                # Informações sobre os profissionais
+                num_profissionais = len(profissionais_selecionados)
+                if num_profissionais > 0:
+                    st.caption(f"📊 **{num_profissionais} profissional(is) selecionado(s)** | "
+                              f"**Média de atendimentos por dia:** {media_atendimentos:.1f} | "
+                              f"**Total de dias:** {len(todos_dias_disponiveis)}")
+            else:
+                st.warning("Nenhum dado disponível para exibir o gráfico temporal.")
             
-            st.altair_chart(chart_temporal, use_container_width=True)
+            # Gráfico de Status
+            st.markdown("---")
+            st.subheader("Distribuição de Status")
             
-            # Informações sobre os profissionais
-            num_profissionais = len(profissionais_selecionados)
-            if num_profissionais > 0:
-                st.caption(f"📊 **{num_profissionais} profissional(is) selecionado(s)** | "
-                          f"**Média de atendimentos por dia:** {media_atendimentos:.1f} | "
-                          f"**Total de dias:** {len(todos_dias_disponiveis)}")
-        else:
-            st.warning("Nenhum dado disponível para exibir o gráfico temporal.")
-        
-        # Gráfico de Status
-        st.markdown("---")
-        st.subheader("Distribuição de Status")
-        
-        status_counts = df_filtrado.groupby('Status_Consolidado').size().reset_index(name='Quantidade')
-        status_counts = status_counts.sort_values('Quantidade', ascending=False)
-        
-        # Criar campo combinado com status e quantidade para a legenda
-        status_counts_com_legenda = status_counts.copy()
-        status_counts_com_legenda['Status_Completo'] = status_counts_com_legenda.apply(
-            lambda row: f"{row['Status_Consolidado']} ({row['Quantidade']} atendimentos)", 
-            axis=1
-        )
-        
-        # Gráfico de Pizza para Distribuição de Status
-        chart_status_pizza = alt.Chart(status_counts_com_legenda).mark_arc(innerRadius=0).encode(
-            theta=alt.Theta('Quantidade:Q', stack=True),
-            color=alt.Color('Status_Completo:N', 
-                          scale=alt.Scale(scheme='set2'),
-                          legend=alt.Legend(title='Status de Atendimento', 
-                                          orient='right',
-                                          labelLimit=500,
-                                          labelFontSize=14,
-                                          titleFontSize=16,
-                                          offset=10,
-                                          padding=10,
-                                          columnPadding=5)),
-            tooltip=[alt.Tooltip('Status_Consolidado:N', title='Status'), 
-                    alt.Tooltip('Quantidade:Q', title='Quantidade')]
-        ).properties(height=400, width=500).configure_view(strokeWidth=0)
-        
-        st.altair_chart(chart_status_pizza, use_container_width=True)
-        
-        # Estatísticas abaixo do gráfico de pizza
-        if len(status_counts) > 0:
-            st.caption(f"📊 **Total:** {status_counts['Quantidade'].sum()} atendimentos")
-        
-        st.markdown("---")
-        
-        # Gráfico de Status por Profissional (em linha completa)
-        st.subheader("Status por Profissional (Top 10)")
-        status_prof = df_filtrado.groupby(['Profissional', 'Status_Consolidado']).size().reset_index(name='Quantidade')
-        
-        # Pegar os top 10 profissionais por quantidade total
-        total_por_prof = status_prof.groupby('Profissional')['Quantidade'].sum().reset_index(name='Total')
-        top_10_profissionais = total_por_prof.nlargest(10, 'Total')['Profissional'].tolist()
-        
-        # Filtrar apenas os top 10 profissionais
-        status_prof_top10 = status_prof[status_prof['Profissional'].isin(top_10_profissionais)]
-        
-        # Ordenar alfabeticamente pelos nomes dos profissionais
-        status_prof_top10 = status_prof_top10.sort_values('Profissional', ascending=True)
-        
-        chart_status_prof = alt.Chart(status_prof_top10).mark_bar().encode(
-            x=alt.X('Quantidade:Q', title='Quantidade'),
-            y=alt.Y('Profissional:N', sort='y', title='Profissional'),  # Ordenar alfabeticamente
-            color=alt.Color('Status_Consolidado:N', 
-                          scale=alt.Scale(scheme='set2'),
-                          legend=alt.Legend(title='Status de Atendimento',
-                                          orient='right',
-                                          labelFontSize=12,
-                                          titleFontSize=14)),
-            tooltip=['Profissional', 'Status_Consolidado', 'Quantidade']
-        ).properties(height=400)
-        
-        st.altair_chart(chart_status_prof, use_container_width=True)
-        
-        # ========== TABELA DE DADOS ==========
-        st.markdown("---")
-        with st.expander("📋 Visualizar Dados Filtrados"):
-            st.dataframe(
-                df_filtrado,
-                use_container_width=True,
-                height=400
+            status_counts = df_filtrado.groupby('Status_Consolidado').size().reset_index(name='Quantidade')
+            status_counts = status_counts.sort_values('Quantidade', ascending=False)
+            
+            # Criar campo combinado com status e quantidade para a legenda
+            status_counts_com_legenda = status_counts.copy()
+            status_counts_com_legenda['Status_Completo'] = status_counts_com_legenda.apply(
+                lambda row: f"{row['Status_Consolidado']} ({row['Quantidade']} atendimentos)", 
+                axis=1
             )
             
-            # Botão para download
-            csv = df_filtrado.to_csv(index=False).encode('utf-8-sig')
-            st.download_button(
-                label="📥 Baixar dados filtrados (CSV)",
-                data=csv,
-                file_name="dados_filtrados.csv",
-                mime="text/csv"
-            )
+            # Gráfico de Pizza para Distribuição de Status
+            chart_status_pizza = alt.Chart(status_counts_com_legenda).mark_arc(innerRadius=0).encode(
+                theta=alt.Theta('Quantidade:Q', stack=True),
+                color=alt.Color('Status_Completo:N', 
+                              scale=alt.Scale(scheme='set2'),
+                              legend=alt.Legend(title='Status de Atendimento', 
+                                              orient='right',
+                                              labelLimit=500,
+                                              labelFontSize=14,
+                                              titleFontSize=16,
+                                              offset=10,
+                                              padding=10,
+                                              columnPadding=5)),
+                tooltip=[alt.Tooltip('Status_Consolidado:N', title='Status'), 
+                        alt.Tooltip('Quantidade:Q', title='Quantidade')]
+            ).properties(height=400, width=500).configure_view(strokeWidth=0)
+            
+            st.altair_chart(chart_status_pizza, use_container_width=True)
+            
+            # Estatísticas abaixo do gráfico de pizza
+            if len(status_counts) > 0:
+                st.caption(f"📊 **Total:** {status_counts['Quantidade'].sum()} atendimentos")
+            
+            st.markdown("---")
+            
+            # Gráfico de Status por Profissional (em linha completa)
+            st.subheader("Status por Profissional (Top 10)")
+            status_prof = df_filtrado.groupby(['Profissional', 'Status_Consolidado']).size().reset_index(name='Quantidade')
+            
+            # Pegar os top 10 profissionais por quantidade total
+            total_por_prof = status_prof.groupby('Profissional')['Quantidade'].sum().reset_index(name='Total')
+            top_10_profissionais = total_por_prof.nlargest(10, 'Total')['Profissional'].tolist()
+            
+            # Filtrar apenas os top 10 profissionais
+            status_prof_top10 = status_prof[status_prof['Profissional'].isin(top_10_profissionais)]
+            
+            # Ordenar alfabeticamente pelos nomes dos profissionais
+            status_prof_top10 = status_prof_top10.sort_values('Profissional', ascending=True)
+            
+            chart_status_prof = alt.Chart(status_prof_top10).mark_bar().encode(
+                x=alt.X('Quantidade:Q', title='Quantidade'),
+                y=alt.Y('Profissional:N', sort='y', title='Profissional'),  # Ordenar alfabeticamente
+                color=alt.Color('Status_Consolidado:N', 
+                              scale=alt.Scale(scheme='set2'),
+                              legend=alt.Legend(title='Status de Atendimento',
+                                              orient='right',
+                                              labelFontSize=12,
+                                              titleFontSize=14)),
+                tooltip=['Profissional', 'Status_Consolidado', 'Quantidade']
+            ).properties(height=400)
+            
+            st.altair_chart(chart_status_prof, use_container_width=True)
+            
+            # ========== TABELA DE DADOS ==========
+            st.markdown("---")
+            with st.expander("📋 Visualizar Dados Filtrados"):
+                st.dataframe(
+                    df_filtrado,
+                    use_container_width=True,
+                    height=400
+                )
+                
+                # Botão para download
+                csv = df_filtrado.to_csv(index=False).encode('utf-8-sig')
+                st.download_button(
+                    label="📥 Baixar dados filtrados (CSV)",
+                    data=csv,
+                    file_name="dados_filtrados.csv",
+                    mime="text/csv"
+                )
+        
+        with tab2:
+            # ========== PÁGINA DE CRUZAMENTO DE ATENDIMENTOS ==========
+            exibir_pagina_cruzamento(df)
         
         # Informações sobre o dataset
         st.sidebar.markdown("---")
